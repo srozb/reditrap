@@ -24,6 +24,97 @@ RESP_MAX_ARRAY_LENGTH = 128
 _logger = logging.getLogger("reditrap")
 
 
+REDIS_INFO_PAYLOAD_TEMPLATE = """# Server
+redis_version:{redis_version}
+redis_git_sha1:00000000
+redis_git_dirty:0
+redis_build_id:e7873c849a0397f9
+redis_mode:standalone
+os:Linux 4.15.0-34-generic x86_64
+arch_bits:64
+multiplexing_api:epoll
+gcc_version:4.7.2
+process_id:1
+run_id:badba07e346c19a7dba51425ef9cbdda9e16cd0f
+tcp_port:6379
+uptime_in_seconds:11919163
+uptime_in_days:137
+hz:10
+lru_clock:15078568
+config_file:
+
+# Clients
+connected_clients:24
+client_longest_output_list:0
+client_biggest_input_buf:0
+blocked_clients:0
+
+# Memory
+used_memory:2709224
+used_memory_human:2.58M
+used_memory_rss:6471680
+used_memory_peak:6141512
+used_memory_peak_human:5.86M
+used_memory_lua:1173504
+mem_fragmentation_ratio:2.39
+mem_allocator:jemalloc-3.6.0
+
+# Persistence
+loading:0
+rdb_changes_since_last_save:476
+rdb_bgsave_in_progress:0
+rdb_last_save_time:1759893618
+rdb_last_bgsave_status:err
+rdb_last_bgsave_time_sec:0
+rdb_current_bgsave_time_sec:-1
+aof_enabled:0
+aof_rewrite_in_progress:0
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:-1
+aof_current_rewrite_time_sec:-1
+aof_last_bgrewrite_status:ok
+aof_last_write_status:ok
+
+# Stats
+total_connections_received:13496
+total_commands_processed:520743
+instantaneous_ops_per_sec:0
+total_net_input_bytes:111855324
+total_net_output_bytes:2198564329
+instantaneous_input_kbps:0.00
+instantaneous_output_kbps:0.00
+rejected_connections:0
+sync_full:0
+sync_partial_ok:0
+sync_partial_err:0
+expired_keys:0
+evicted_keys:0
+keyspace_hits:753
+keyspace_misses:85640
+pubsub_channels:0
+pubsub_patterns:0
+latest_fork_usec:695
+
+# Replication
+role:master
+connected_slaves:0
+master_repl_offset:0
+repl_backlog_active:0
+repl_backlog_size:1048576
+repl_backlog_first_byte_offset:0
+repl_backlog_histlen:0
+
+# CPU
+used_cpu_sys:16849.86
+used_cpu_user:7917.13
+used_cpu_sys_children:401.81
+used_cpu_user_children:1250.19
+
+# Keyspace
+db0:keys=23,expires=19,avg_ttl=84330409
+"""
+
+
 class RESPProtocolError(Exception):
     """Raised when incoming data is not valid RESP."""
 
@@ -34,8 +125,14 @@ async def _read_exactly(reader: asyncio.StreamReader, length: int) -> bytes:
 
 
 async def _read_line(reader: asyncio.StreamReader) -> bytes:
-    line = await reader.readuntil(b"\r\n")
-    return line[:-2]
+    line = await reader.readline()
+    if not line:
+        raise asyncio.IncompleteReadError(partial=b"", expected=1)
+    if line.endswith(b"\r\n"):
+        return line[:-2]
+    if line.endswith(b"\n"):
+        return line[:-1]
+    raise RESPProtocolError("line missing LF terminator")
 
 
 def _decode_bulk(data: bytes) -> str:
@@ -260,8 +357,35 @@ def _handle_command(command: str, args: Sequence[str], state: HoneypotState) -> 
         return _resp_simple_string("OK"), "auth", None
 
     if cmd_upper == "INFO":
-        payload = "# Server\nredis_version:" + state.redis_version + "\n# Lua\nlua_version:5.1\n"
+        payload = REDIS_INFO_PAYLOAD_TEMPLATE.format(redis_version=state.redis_version)
         return _resp_bulk_string(payload), "info", None
+
+    if cmd_upper == "PUBSUB":
+        if not args:
+            return (
+                _resp_error("ERR wrong number of arguments for 'pubsub' command"),
+                "pubsub_error",
+                {"arg_count": 0},
+            )
+        subcommand = args[0].upper()
+        if subcommand == "CHANNELS":
+            pattern = args[1] if len(args) >= 2 else None
+            info = {"subcommand": "CHANNELS", "match_pattern": pattern, "channel_count": 0}
+            return _resp_array([]), "pubsub_channels", info
+        return (
+            _resp_error("ERR Unknown subcommand or wrong number of arguments for 'PUBSUB'."),
+            "pubsub_error",
+            {"subcommand": args[0]},
+        )
+
+    if cmd_upper == "KEYS":
+        if len(args) != 1:
+            return (
+                _resp_error("ERR wrong number of arguments for 'keys' command"),
+                "keys_error",
+                {"arg_count": len(args)},
+            )
+        return _resp_array([]), "keys", {"pattern": args[0], "key_count": 0}
 
     if cmd_upper == "HELLO":
         # Older Redis instances (the vulnerable ones) did not support HELLO, mimic that.
